@@ -4,15 +4,19 @@
            , LambdaCase
            , TemplateHaskell
            , FlexibleContexts
+           , TupleSections
+           , RecordWildCards
            #-}
 module Language.Haskell.Tools.Refactor.Daemon where
 
 import Control.Applicative ((<|>))
+import Control.Concurrent
 import Control.Concurrent.MVar
+import Control.Concurrent.Chan
 import Control.Exception
 import Control.Monad
 import Control.Monad.State
-import Control.Reference
+import Control.Reference hiding (modifyMVarMasked_)
 import qualified Data.Aeson as A ((.=))
 import Data.Aeson hiding ((.=))
 import Data.ByteString.Lazy.Char8 (ByteString)
@@ -30,6 +34,7 @@ import Network.Socket.ByteString.Lazy
 import System.Directory
 import System.Environment
 import System.IO
+import qualified System.FSNotify as FS
 import Data.Algorithm.Diff
 import Data.Either
 
@@ -56,6 +61,284 @@ import Language.Haskell.Tools.Refactor.Session
 
 import Debug.Trace
 
+data ClientMessage
+  = KeepAlive
+  | SetPackageDB { pkgDB :: PackageDB }
+  | AddPackages { addedPathes :: [FilePath] }
+  | RemovePackages { removedPathes :: [FilePath] }
+  | PerformRefactoring { refactoring :: String
+                       , modulePath :: FilePath
+                       , editorSelection :: String
+                       , details :: [String]
+                       }
+  | Stop
+  | Disconnect
+  | ReLoad { changedModules :: [FilePath]
+           , removedModules :: [FilePath]
+           }
+  deriving (Show, Generic)
+
+instance FromJSON ClientMessage
+
+data ResponseMsg
+  = KeepAliveResponse
+  | ErrorMessage { errorMsg :: String }
+  | CompilationProblem { errorMarkers :: [(SrcSpan, String)] }
+  | ModulesChanged { undoChanges :: [UndoRefactor] }
+  | LoadedModules { loadedModules :: [(FilePath, String)] }
+  | LoadingModules { modulesToLoad :: [FilePath] }
+  | Disconnected
+  deriving (Show, Generic)
+
+instance ToJSON ResponseMsg
+
+instance ToJSON SrcSpan where
+  toJSON (RealSrcSpan sp) = object [ "file" A..= unpackFS (srcSpanFile sp)
+                                   , "startRow" A..= srcLocLine (realSrcSpanStart sp)
+                                   , "startCol" A..= srcLocCol (realSrcSpanStart sp)
+                                   , "endRow" A..= srcLocLine (realSrcSpanEnd sp)
+                                   , "endCol" A..= srcLocCol (realSrcSpanEnd sp)
+                                   ]
+  toJSON _ = Null
+
+data UndoRefactor = RemoveAdded { undoRemovePath :: FilePath }
+                  | RestoreRemoved { undoRestorePath :: FilePath
+                                   , undoRestoreContents :: String
+                                   }
+                  | UndoChanges { undoChangedPath :: FilePath
+                                , undoDiff :: FileDiff
+                                }
+  deriving (Show, Generic)
+
+instance ToJSON UndoRefactor
+
+type FileDiff = [(Int, Int, String)]
+
+
+data RequestContainer
+  = RequestContainer { content :: MVar ([ClientMessage],[FilePath])
+                     , content_lock :: MVar ()
+                     }
+mkRequestContainer :: IO RequestContainer
+mkRequestContainer = RequestContainer <$> newEmptyMVar <*> (newMVar ())
+
+getRequests :: RequestContainer -> IO ([ClientMessage],[FilePath])
+getRequests (RequestContainer {..}) = do
+    takeMVar content_lock
+    c <- takeMVar content
+    putMVar content_lock ()
+    return c
+
+putRequest :: RequestContainer -> ClientMessage -> IO ()
+putRequest (RequestContainer {..}) cm = do
+    takeMVar content_lock
+    b <- tryPutMVar content ([cm],[])
+    if b then return () else modifyMVarMasked_ content $ \ (cml, fs) -> return (cml++[cm], fs)
+    putMVar content_lock ()
+
+putChangedFiles :: RequestContainer -> [FilePath] -> IO ()
+putChangedFiles (RequestContainer {..}) fs = do
+    takeMVar content_lock
+    b <- tryPutMVar content ([],fs)
+    if b then return () else modifyMVarMasked_ content $ \ (cml, fsl) -> return (cml, fsl ++ fs)
+    putMVar content_lock ()
+
+
+data RefactoringProtocol
+  = SafeRefactoringProtocol
+  | UnsafeRefactoringProtocol
+
+
+data SystemInterface
+  = SystemInterface { _refactoringProtocol :: RefactoringProtocol
+                    , _endSocketConnectionNotify :: IO ()
+                    }
+makeReferences ''SystemInterface
+
+data SReqInterface
+  = SReqInterface { {-_sockReq :: IO (Maybe ClientMessage)
+                  , _sockReqAll :: IO [ClientMessage]
+                  , -}_shutdownSReq :: IO ()
+                  }
+makeReferences ''SReqInterface
+
+data SResInterface
+  = SResInterface { _sockRes :: ResponseMsg -> IO ()
+                  , _shutdownSRes :: IO ()
+                  }
+makeReferences ''SResInterface
+
+data FSRegistration
+  = FSRegistration { _fsregistration :: FilePath }
+  | FSUnregistration { _fsunregistration :: FilePath }
+makeReferences ''FSRegistration
+
+data FSInterface
+  = FSInterface { _filePathRegister :: FSRegistration -> IO ()
+                , {-_changedFiles :: IO ClientMessage
+                , -}_shutdownFS :: IO ()
+                }
+makeReferences ''FSInterface
+
+data MergeInterface
+  = MergeInterface { _request :: IO ClientMessage          -- call: work -> merge
+                   , _response :: ResponseMsg -> IO ()     -- call: work -> merge
+                   , _newRequest :: ClientMessage -> IO () -- call: sreq -> merge
+                   , _newFsChanges :: [FilePath] -> IO ()  -- call: fs -> merge
+                   , _shutdownMerge :: IO ()               -- call: main/spawner -> merge
+                   }
+makeReferences ''MergeInterface
+
+data WorkInterface
+  = WorkInterface { _shutdownWork :: IO ()                 -- call: main/spawner -> work
+                  }
+makeReferences ''WorkInterface
+
+{-
+readMVarChan :: MVar [a] -> IO (Maybe a)
+readMVarChan mvar = modifyMVarMasked mvar (return . split)
+  where
+    split [] = ([], Nothing)
+    split (x:xs) = (xs, Just x)
+
+readAllMVarChan :: MVar [a] -> IO [a]
+readAllMVarChan mvar = modifyMVarMasked mvar (return . ([],))
+
+putMVarChan :: MVar [a] -> a -> IO ()
+putMVarChan mvar elem = modifyMVarMasked_ mvar (return . (++[elem]))
+-}
+
+-- | spawn socket request handler
+spawnSReq :: MergeInterface -> SystemInterface -> Socket -> IO SReqInterface
+spawnSReq merge system sock = do
+    --reqChan <- newMVar []
+    accMVar <- newMVar BS.empty
+    tid <- forkIO $ forever $ do
+        acc <- takeMVar accMVar
+        received <- recv sock 2048
+        let raw = BS.concat [acc, received]
+            process raw_msg = case decode raw_msg of
+                (Just msg) -> (merge ^. newRequest) msg --putMVarChan reqChan msg
+                Nothing    -> return () -- next $ encode $ ErrorMessage $ "MALFORMED MESSAGE: " ++ unpack mess
+            loop rawData = do
+                case rawData of
+                    [] -> return ()
+                    [new_acc] -> do
+                        putMVar accMVar new_acc
+                    (raw_msg:other_msgs) -> do
+                        process raw_msg
+                        loop other_msgs
+        when (not $ BS.null received) (system ^. endSocketConnectionNotify)
+        loop (BS.split '\n' raw)
+
+    return SReqInterface { {-_sockReq = readMVarChan reqChan
+                         , _sockReqAll = readAllMVarChan reqChan
+                         , -}_shutdownSReq = killThread tid
+                         }
+
+-- | spawn socket response handler
+spawnSRes :: Socket -> IO SResInterface
+spawnSRes sock = do
+    resMVar <- newEmptyMVar
+    tid <- forkIO $ forever $ do
+        msg <- takeMVar resMVar
+        sendAll sock (BS.snoc (encode msg) '\n')
+
+    return SResInterface { _sockRes = putMVar resMVar
+                         , _shutdownSRes = killThread tid
+                         }
+
+-- | spawn file system change notifying handler
+spawnFS :: MergeInterface -> IO FSInterface
+spawnFS merge = do
+    state <- newMVar Map.empty
+    regChan <- newChan
+    cndMVar <- newMVar (ReLoad [] [])
+    let process e = case e of
+          (FS.Added fp _) -> return ()
+          (FS.Modified fp _) -> (merge ^. newFsChanges) [fp] -- (modified fp) -- changedFiles (modified fp)-- modifyMVarMasked_ cndMVar (modified fp)
+          (FS.Removed fp _) -> (merge ^. newFsChanges) [fp] -- (removed fp) -- changedFiles (removed fp) -- modifyMVarMasked_ cndMVar (removed fp)
+        modified fp (ReLoad ml dl) = return (ReLoad (nub (fp:ml)) dl)
+        removed fp (ReLoad ml dl) = return (ReLoad ml (nub (fp:dl)))
+        stop fp m = case Map.lookup fp m of
+          Nothing -> return m
+          (Just mng) -> do
+            FS.stopManager mng
+            return (Map.delete fp m)
+    tid <- forkIO $ forever $ do
+        reg <- readChan regChan
+        case reg of
+          (FSRegistration fp) -> do
+              mng <- FS.startManager
+              modifyMVarMasked_ state (return . Map.insert fp mng)
+              FS.watchTree
+                  mng
+                  fp
+                  (const True)
+                  process
+              return ()
+          (FSUnregistration fp) -> modifyMVarMasked_ state (stop fp)
+
+    return FSInterface { _filePathRegister = writeChan regChan
+                       , {-_changedFiles = readMVar cndMVar
+                       , -}_shutdownFS = undefined
+                       }
+
+-- | spawn communication chanel switch
+spawnMerge :: MVar RefactoringProtocol -> SResInterface -> IO MergeInterface
+spawnMerge prot sres = do
+    reqMsgMVar <- newEmptyMVar
+    resMsgMVar <- newEmptyMVar
+    rc <- mkRequestContainer
+    tid <- forkIO $ forever $ do
+--        (ReLoad ml dl) <- (fs ^. changedFiles)
+--        if (length ml > 0) || (length dl > 0)
+--          then do
+--            putMVar reqMsgMVar (ReLoad ml dl)
+--            void $ takeMVar resMsgMVar
+--          else do
+            protocol <- readMVar prot
+            (cls,fps) <- getRequests rc
+            case protocol of
+              SafeRefactoringProtocol -> do
+                if length fps > 0
+                  then void $ do
+                    putMVar reqMsgMVar (ReLoad fps [])
+                    takeMVar resMsgMVar
+                  else void $ do
+                    putMVar reqMsgMVar (head cls)
+                    res <- takeMVar resMsgMVar
+                    (sres ^. sockRes) res
+              UnsafeRefactoringProtocol -> do
+                if length fps > 0
+                  then void $ do
+                    putMVar reqMsgMVar (ReLoad fps [])
+                    takeMVar resMsgMVar
+                  else forM_ cls $ \ cl -> do
+                    putMVar reqMsgMVar cl
+                    res <- takeMVar resMsgMVar
+                    (sres ^. sockRes) res
+            return ()
+    return MergeInterface { _request = takeMVar reqMsgMVar
+                          , _response = putMVar resMsgMVar
+                          , _newRequest = putRequest rc
+                          , _newFsChanges = putChangedFiles rc
+                            -- \ (ReLoad ml dl) -> putChangedFiles rc (ReLoad (nub ml) (nub dl))
+                          , _shutdownMerge = killThread tid
+                          }
+
+
+-- | spawn worker
+spawnWork :: MergeInterface -> IO WorkInterface
+spawnWork merge = do
+    tid <- forkIO $ forever $ do
+        msg <- (merge ^. request)
+        msg' <- undefined
+        (merge ^. response) msg'
+    return WorkInterface { _shutdownWork = killThread tid
+                         }
+
+
 -- TODO: handle boot files
 
 runDaemonCLI :: IO ()
@@ -77,6 +360,9 @@ runDaemon args = withSocketsDo $
 
 defaultArgs :: [String]
 defaultArgs = ["4123", "True"]
+
+
+
 
 clientLoop :: Bool -> Socket -> IO ()
 clientLoop isSilent sock
@@ -227,18 +513,7 @@ updateClient resp (PerformRefactoring refact modPath selection args) = do
                liftIO $ case reloadRes of Left errs -> resp (either ErrorMessage (ErrorMessage . ("The result of the refactoring contains errors: " ++) . show) (getProblems errs))
                                           Right _ -> return ()
 
-data UndoRefactor = RemoveAdded { undoRemovePath :: FilePath }
-                  | RestoreRemoved { undoRestorePath :: FilePath
-                                   , undoRestoreContents :: String
-                                   }
-                  | UndoChanges { undoChangedPath :: FilePath
-                                , undoDiff :: FileDiff
-                                }
-  deriving (Show, Generic)
 
-instance ToJSON UndoRefactor
-
-type FileDiff = [(Int, Int, String)]
 
 createUndo :: Eq a => Int -> [Diff [a]] -> [(Int, Int, [a])]
 createUndo i (Both str _ : rest) = createUndo (i + length str) rest
@@ -266,42 +541,3 @@ getProblems :: RefactorException -> Either String [(SrcSpan, String)]
 getProblems (SourceCodeProblem errs) = Right $ map (\err -> (errMsgSpan err, show err)) $ bagToList errs
 getProblems other = Left $ displayException other
 
-data ClientMessage
-  = KeepAlive
-  | SetPackageDB { pkgDB :: PackageDB }
-  | AddPackages { addedPathes :: [FilePath] }
-  | RemovePackages { removedPathes :: [FilePath] }
-  | PerformRefactoring { refactoring :: String
-                       , modulePath :: FilePath
-                       , editorSelection :: String
-                       , details :: [String]
-                       }
-  | Stop
-  | Disconnect
-  | ReLoad { changedModules :: [FilePath]
-           , removedModules :: [FilePath]
-           }
-  deriving (Show, Generic)
-
-instance FromJSON ClientMessage
-
-data ResponseMsg
-  = KeepAliveResponse
-  | ErrorMessage { errorMsg :: String }
-  | CompilationProblem { errorMarkers :: [(SrcSpan, String)] }
-  | ModulesChanged { undoChanges :: [UndoRefactor] }
-  | LoadedModules { loadedModules :: [(FilePath, String)] }
-  | LoadingModules { modulesToLoad :: [FilePath] }
-  | Disconnected
-  deriving (Show, Generic)
-
-instance ToJSON ResponseMsg
-
-instance ToJSON SrcSpan where
-  toJSON (RealSrcSpan sp) = object [ "file" A..= unpackFS (srcSpanFile sp)
-                                   , "startRow" A..= srcLocLine (realSrcSpanStart sp)
-                                   , "startCol" A..= srcLocCol (realSrcSpanStart sp)
-                                   , "endRow" A..= srcLocLine (realSrcSpanEnd sp)
-                                   , "endCol" A..= srcLocCol (realSrcSpanEnd sp)
-                                   ]
-  toJSON _ = Null

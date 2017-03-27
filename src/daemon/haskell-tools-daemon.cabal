@@ -54,7 +54,7 @@ extra-source-files: examples/Project/has-cabal/*.hs
 library
   ghc-options:         -O2
   build-depends:       base                      >= 4.9   && < 5.0
-                     , aeson                     >= 1.0  && < 1.2
+                     , aeson                     >= 1.0   && < 1.2
                      , bytestring                >= 0.10  && < 1.0
                      , filepath                  >= 1.4   && < 2.0
                      , containers                >= 0.5   && < 0.6
@@ -67,6 +67,7 @@ library
                      , references                >= 0.3.2 && < 1.0
                      , network                   >= 2.6   && < 3.0
                      , Diff                      >= 0.3   && < 0.4
+                     , fsnotify                  >= 0.2.1 && < 1.0
                      , haskell-tools-ast         >= 0.5   && < 0.6
                      , haskell-tools-prettyprint >= 0.5   && < 0.6
                      , haskell-tools-refactor    >= 0.5   && < 0.6
