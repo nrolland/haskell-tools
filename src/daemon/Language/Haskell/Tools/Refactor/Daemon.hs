@@ -179,6 +179,7 @@ makeReferences ''FSInterface
 data MergeInterface
   = MergeInterface { _request :: IO ClientMessage          -- call: work -> merge
                    , _response :: ResponseMsg -> IO ()     -- call: work -> merge
+                   , _workFinish :: IO ()                  -- call: work -> merge
                    , _newRequest :: ClientMessage -> IO () -- call: sreq -> merge
                    , _newFsChanges :: [FilePath] -> IO ()  -- call: fs -> merge
                    , _shutdownMerge :: IO ()               -- call: main/spawner -> merge
@@ -307,6 +308,7 @@ spawnMerge :: SystemInterface -> SResInterface -> IO MergeInterface
 spawnMerge si sres = do
     reqMsgMVar <- newEmptyMVar
     resMsgMVar <- newEmptyMVar
+    finishMVar <- newEmptyMVar
     rc <- mkRequestContainer
     tid <- forkIO $ forever $ do
 --        (ReLoad ml dl) <- (fs ^. changedFiles)
@@ -339,6 +341,7 @@ spawnMerge si sres = do
     return MergeInterface { _request = takeMVar reqMsgMVar
                           , _response = putMVar resMsgMVar
                           , _newRequest = putRequest rc
+                          , _workFinish = putMVar workFinish ()
                           , _newFsChanges = putChangedFiles rc
                             -- \ (ReLoad ml dl) -> putChangedFiles rc (ReLoad (nub ml) (nub dl))
                           , _shutdownMerge = killThread tid
@@ -346,23 +349,23 @@ spawnMerge si sres = do
 
 
 -- | spawn worker
-spawnWork :: MergeInterface -> IO WorkInterface
-spawnWork merge = do
+spawnWork :: Session -> MVar DaemonSessionState -> MergeInterface -> FSInterface -> IO WorkInterface
+spawnWork ghcSess daemonState merge fs = do
     tid <- forkIO $ forever $ do
         msg <- (merge ^. request)
-        msg' <- undefined
-        (merge ^. response) msg'
+        modifyMVar daemonState (\st -> swap <$> reflectGhc (runStateT (updateClient fs (merge ^. response) msg) st) ghcSess)
+        merge ^. workFinish
     return WorkInterface { _shutdownWork = killThread tid
                          }
 
-buildSystem :: RefactoringProtocol -> Socket -> IO SystemInterface
-buildSystem prot sock = do
+buildSystem :: Session -> MVar DaemonSessionState -> RefactoringProtocol -> Socket -> IO SystemInterface
+buildSystem session daemonState prot sock = do
   si <- mkSystemInterface prot sock
   _sresI <- spawnSRes sock
   _mergeI <- spawnMerge si _sresI
   _sreqI <- spawnSReq si _mergeI
   _fsI <- spawnFS _mergeI
-  _workI <- spawnWork _mergeI
+  _workI <- spawnWork session daemonState _mergeI _fsI
 
   let _refactoringProtocol = prot
       _siSocket            = sock
@@ -391,52 +394,50 @@ runDaemon args = withSocketsDo $
 defaultArgs :: [String]
 defaultArgs = ["4123", "True"]
 
-
-
-
 clientLoop :: Bool -> Socket -> IO ()
 clientLoop isSilent sock
   = do when (not isSilent) $ putStrLn $ "Starting client loop"
        (conn,_) <- accept sock
        ghcSess <- initGhcSession
        state <- newMVar initSession
-       serverLoop isSilent ghcSess state conn
+       si <- buildSystem ghcSess state SafeRefactoringProtocol conn
        sessionData <- readMVar state
        when (not (sessionData ^. exiting))
          $ clientLoop isSilent sock
 
-serverLoop :: Bool -> Session -> MVar DaemonSessionState -> Socket -> IO ()
-serverLoop isSilent ghcSess state sock =
-    do msg <- recv sock 2048
-       when (not $ BS.null msg) $ do -- null on TCP means closed connection
-         when (not isSilent) $ putStrLn $ "message received: " ++ show (unpack msg)
-         let msgs = BS.split '\n' msg
-         continue <- forM msgs $ \msg -> respondTo ghcSess state (sendAll sock . (`BS.snoc` '\n')) msg
-         sessionData <- readMVar state
-         when (not (sessionData ^. exiting) && all (== True) continue)
-           $ serverLoop isSilent ghcSess state sock
-  `catch` interrupted
-  where interrupted = \ex -> do
-                        let err = show (ex :: IOException)
-                        when (not isSilent) $ do
-                          putStrLn "Closing down socket"
-                          hPutStrLn stderr $ "Some exception caught: " ++ err
+-- serverLoop :: Bool -> Session -> MVar DaemonSessionState -> Socket -> IO ()
+-- serverLoop isSilent ghcSess state sock =
+--     do msg <- recv sock 2048
+--        when (not $ BS.null msg) $ do -- null on TCP means closed connection
+--          when (not isSilent) $ putStrLn $ "message received: " ++ show (unpack msg)
+--          let msgs = BS.split '\n' msg
+--          continue <- forM msgs $ \msg -> respondTo ghcSess state (sendAll sock . (`BS.snoc` '\n')) msg
+--          sessionData <- readMVar state
+--          when (not (sessionData ^. exiting) && all (== True) continue)
+--            $ serverLoop isSilent ghcSess state sock
+--   `catch` interrupted
+--   where interrupted = \ex -> do
+--                         let err = show (ex :: IOException)
+--                         when (not isSilent) $ do
+--                           putStrLn "Closing down socket"
+--                           hPutStrLn stderr $ "Some exception caught: " ++ err
 
-respondTo :: Session -> MVar DaemonSessionState -> (ByteString -> IO ()) -> ByteString -> IO Bool
-respondTo ghcSess state next mess
-  | BS.null mess = return True
-  | otherwise
-  = case decode mess of
-      Nothing -> do next $ encode $ ErrorMessage $ "MALFORMED MESSAGE: " ++ unpack mess
-                    return True
-      Just req -> modifyMVar state (\st -> swap <$> reflectGhc (runStateT (updateClient (next . encode) req) st) ghcSess)
+-- respondTo :: Session -> MVar DaemonSessionState -> (ByteString -> IO ()) -> ByteString -> IO Bool
+-- respondTo ghcSess state next mess
+--   | BS.null mess = return True
+--   | otherwise
+--   = case decode mess of
+--       Nothing -> do next $ encode $ ErrorMessage $ "MALFORMED MESSAGE: " ++ unpack mess
+--                     return True
+--       Just req -> modifyMVar state (\st -> swap <$> reflectGhc (runStateT (updateClient (next . encode) req) st) ghcSess)
 
 -- | This function does the real job of acting upon client messages in a stateful environment of a client
-updateClient :: (ResponseMsg -> IO ()) -> ClientMessage -> StateT DaemonSessionState Ghc Bool
-updateClient resp KeepAlive = liftIO (resp KeepAliveResponse) >> return True
-updateClient resp Disconnect = liftIO (resp Disconnected) >> return False
-updateClient _ (SetPackageDB pkgDB) = modify (packageDB .= pkgDB) >> return True
-updateClient resp (AddPackages packagePathes) = do
+updateClient :: FSInterface -> (ResponseMsg -> IO ()) -> ClientMessage -> StateT DaemonSessionState Ghc Bool
+updateClient _ resp KeepAlive = liftIO (resp KeepAliveResponse) >> return True
+updateClient _ resp Disconnect = liftIO (resp Disconnected) >> return False
+updateClient _ _ (SetPackageDB pkgDB) = modify (packageDB .= pkgDB) >> return True
+updateClient fs resp (AddPackages packagePathes) = do
+    liftIO $ forM packagePathes $ (fs ^. filePathRegister) . FSRegistration
     existingMCs <- gets (^. refSessMCs)
     let existing = map ms_mod $ (existingMCs ^? traversal & filtered isTheAdded & mcModules & traversal & modRecMS)
     needToReload <- (filter (\ms -> not $ ms_mod ms `elem` existing))
@@ -466,7 +467,8 @@ updateClient resp (AddPackages packagePathes) = do
             usePackageDB pkgDBLocs
             modify (packageDBSet .= True)
 
-updateClient _ (RemovePackages packagePathes) = do
+updateClient fs _ (RemovePackages packagePathes) = do
+    liftIO $ forM packagePathes $ (fs ^. filePathRegister) . FSUnregistration
     mcs <- gets (^. refSessMCs)
     let existing = map ms_mod (mcs ^? traversal & filtered isRemoved & mcModules & traversal & modRecMS)
     lift $ forM_ existing (\modName -> removeTarget (TargetModule (GHC.moduleName modName)))
@@ -476,7 +478,7 @@ updateClient _ (RemovePackages packagePathes) = do
     return True
   where isRemoved mc = (mc ^. mcRoot) `elem` packagePathes
 
-updateClient resp (ReLoad changed removed) =
+updateClient _ resp (ReLoad changed removed) =
   do removedMods <- gets (map ms_mod . filter ((`elem` removed) . getModSumOrig) . (^? refSessMCs & traversal & mcModules & traversal & modRecMS))
      lift $ forM_ removedMods (\modName -> removeTarget (TargetModule (GHC.moduleName modName)))
      modify $ refSessMCs & traversal & mcModules
@@ -489,9 +491,9 @@ updateClient resp (ReLoad changed removed) =
                                 Right _ -> return ()
      return True
 
-updateClient _ Stop = modify (exiting .= True) >> return False
+updateClient _ _ Stop = modify (exiting .= True) >> return False
 
-updateClient resp (PerformRefactoring refact modPath selection args) = do
+updateClient _ resp (PerformRefactoring refact modPath selection args) = do
     (Just actualMod, otherMods) <- getFileMods modPath
     let cmd = analyzeCommand refact (selection:args)
     res <- lift $ performCommand cmd actualMod otherMods
@@ -570,4 +572,3 @@ usePackageDB pkgDbLocs
 getProblems :: RefactorException -> Either String [(SrcSpan, String)]
 getProblems (SourceCodeProblem errs) = Right $ map (\err -> (errMsgSpan err, show err)) $ bagToList errs
 getProblems other = Left $ displayException other
-
