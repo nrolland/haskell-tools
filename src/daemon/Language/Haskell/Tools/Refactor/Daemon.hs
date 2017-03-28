@@ -149,11 +149,7 @@ data RefactoringProtocol
   | UnsafeRefactoringProtocol
 
 
-data SystemInterface
-  = SystemInterface { _refactoringProtocol :: RefactoringProtocol
-                    , _endSocketConnectionNotify :: IO ()
-                    }
-makeReferences ''SystemInterface
+
 
 data SReqInterface
   = SReqInterface { {-_sockReq :: IO (Maybe ClientMessage)
@@ -194,6 +190,28 @@ data WorkInterface
                   }
 makeReferences ''WorkInterface
 
+
+
+data SystemInterface
+  = InitSystem { _refactoringProtocol :: RefactoringProtocol
+               , _siSocket :: Socket
+               , _endSocketConnectionNotify :: MVar (IO ())
+               }
+  | SystemInterface { _refactoringProtocol :: RefactoringProtocol
+                    , _siSocket :: Socket
+                    , _endSocketConnectionNotify :: MVar (IO ())
+                    , _sreqI :: SReqInterface
+                    , _sresI :: SResInterface
+                    , _fsI :: FSInterface
+                    , _mergeI :: MergeInterface
+                    , _workI :: WorkInterface
+                    }
+makeReferences ''SystemInterface
+
+mkSystemInterface :: RefactoringProtocol -> Socket -> IO SystemInterface
+mkSystemInterface prot sock = InitSystem prot sock <$> (newMVar (return ()))
+
+
 {-
 readMVarChan :: MVar [a] -> IO (Maybe a)
 readMVarChan mvar = modifyMVarMasked mvar (return . split)
@@ -209,13 +227,13 @@ putMVarChan mvar elem = modifyMVarMasked_ mvar (return . (++[elem]))
 -}
 
 -- | spawn socket request handler
-spawnSReq :: MergeInterface -> SystemInterface -> Socket -> IO SReqInterface
-spawnSReq merge system sock = do
+spawnSReq :: SystemInterface -> MergeInterface -> IO SReqInterface
+spawnSReq si merge = do
     --reqChan <- newMVar []
     accMVar <- newMVar BS.empty
     tid <- forkIO $ forever $ do
         acc <- takeMVar accMVar
-        received <- recv sock 2048
+        received <- recv (si ^. siSocket) 2048
         let raw = BS.concat [acc, received]
             process raw_msg = case decode raw_msg of
                 (Just msg) -> (merge ^. newRequest) msg --putMVarChan reqChan msg
@@ -228,7 +246,7 @@ spawnSReq merge system sock = do
                     (raw_msg:other_msgs) -> do
                         process raw_msg
                         loop other_msgs
-        when (not $ BS.null received) (system ^. endSocketConnectionNotify)
+        when (not $ BS.null received) (join $ readMVar (si ^. endSocketConnectionNotify))
         loop (BS.split '\n' raw)
 
     return SReqInterface { {-_sockReq = readMVarChan reqChan
@@ -285,8 +303,8 @@ spawnFS merge = do
                        }
 
 -- | spawn communication chanel switch
-spawnMerge :: MVar RefactoringProtocol -> SResInterface -> IO MergeInterface
-spawnMerge prot sres = do
+spawnMerge :: SystemInterface -> SResInterface -> IO MergeInterface
+spawnMerge si sres = do
     reqMsgMVar <- newEmptyMVar
     resMsgMVar <- newEmptyMVar
     rc <- mkRequestContainer
@@ -297,9 +315,8 @@ spawnMerge prot sres = do
 --            putMVar reqMsgMVar (ReLoad ml dl)
 --            void $ takeMVar resMsgMVar
 --          else do
-            protocol <- readMVar prot
             (cls,fps) <- getRequests rc
-            case protocol of
+            case si ^. refactoringProtocol of
               SafeRefactoringProtocol -> do
                 if length fps > 0
                   then void $ do
@@ -338,6 +355,19 @@ spawnWork merge = do
     return WorkInterface { _shutdownWork = killThread tid
                          }
 
+buildSystem :: RefactoringProtocol -> Socket -> IO SystemInterface
+buildSystem prot sock = do
+  si <- mkSystemInterface prot sock
+  _sresI <- spawnSRes sock
+  _mergeI <- spawnMerge si _sresI
+  _sreqI <- spawnSReq si _mergeI
+  _fsI <- spawnFS _mergeI
+  _workI <- spawnWork _mergeI
+
+  let _refactoringProtocol = prot
+      _siSocket            = sock
+      _endSocketConnectionNotify = si ^. endSocketConnectionNotify
+  return SystemInterface {..}
 
 -- TODO: handle boot files
 
