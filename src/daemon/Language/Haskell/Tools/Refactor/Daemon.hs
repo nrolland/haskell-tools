@@ -341,7 +341,7 @@ spawnMerge si sres = do
     return MergeInterface { _request = takeMVar reqMsgMVar
                           , _response = putMVar resMsgMVar
                           , _newRequest = putRequest rc
-                          , _workFinish = putMVar workFinish ()
+                          , _workFinish = putMVar finishMVar ()
                           , _newFsChanges = putChangedFiles rc
                             -- \ (ReLoad ml dl) -> putChangedFiles rc (ReLoad (nub ml) (nub dl))
                           , _shutdownMerge = killThread tid
